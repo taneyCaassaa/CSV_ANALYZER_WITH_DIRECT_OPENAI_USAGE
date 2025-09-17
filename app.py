@@ -842,11 +842,12 @@ HTML_TEMPLATE = '''
 </body>
 </html>
 '''
-assistant = VoiceCSVAssistant()
+assistant = VoiceCSVWebApp()
 app = assistant.app  # expose Flask app for Gunicorn
 
 if __name__ == "__main__":
     assistant.run()
+
 
 
 
