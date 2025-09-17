@@ -1,0 +1,15 @@
+flask
+flask-cors
+requests
+dotenv
+pandas
+numpy
+langchain
+langchain-experimental
+openai
+tabulate
+langchain-community
+websocket
+pyaudio
+langchian-openai
+websocket-client
