@@ -47,12 +47,12 @@ class CSVAnalyzer:
             # Create DataFrame directly from string content
             self.df = pd.read_csv(io.StringIO(csv_content))
             
-            # Store basic info for session persistence
+            # Store basic info for session persistence (JSON serializable)
             self.df_info = {
                 'rows': len(self.df),
                 'columns': len(self.df.columns),
                 'column_names': list(self.df.columns),
-                'dtypes': self.df.dtypes.to_dict()
+                'dtypes': {col: str(dtype) for col, dtype in self.df.dtypes.items()}
             }
             
             logger.info(f"✅ Loaded CSV: {len(self.df)} rows, {len(self.df.columns)} columns")
@@ -111,6 +111,9 @@ class VoiceCSVWebApp:
         # Set secret key for sessions
         self.app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here-change-in-production')
         
+        # Set maximum file size (16MB)
+        self.app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+        
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.client = OpenAI(api_key=self.api_key) if self.api_key else None
         
@@ -121,21 +124,33 @@ class VoiceCSVWebApp:
             logger.warning("⚠️  OPENAI_API_KEY not found. Some features will be disabled.")
         
         self.setup_routes()
+        
+        # Error handler for file size limit
+        @self.app.errorhandler(413)
+        def too_large(e):
+            return jsonify({'success': False, 'error': 'File too large. Maximum size is 16MB.'}), 413
 
     def get_or_create_analyzer(self, session_id: str, csv_content: str = None) -> CSVAnalyzer:
         """Get existing analyzer or create new one"""
-        if session_id not in self.analyzers:
-            if not csv_content:
-                return None
-            
+        # First check if analyzer exists in memory
+        if session_id in self.analyzers:
+            analyzer = self.analyzers[session_id]
+            # Verify analyzer is still valid
+            if analyzer.df is not None and analyzer.agent is not None:
+                return analyzer
+            else:
+                # Clean up invalid analyzer
+                del self.analyzers[session_id]
+        
+        # Create new analyzer if content is provided
+        if csv_content:
             analyzer = CSVAnalyzer(self.api_key)
             if analyzer.load_data_from_content(csv_content):
                 if analyzer.create_agent():
                     self.analyzers[session_id] = analyzer
                     return analyzer
-            return None
         
-        return self.analyzers[session_id]
+        return None
 
     def speech_to_text(self, audio_data: bytes) -> str:
         if not self.client:
@@ -202,8 +217,24 @@ class VoiceCSVWebApp:
                 if not file.filename.lower().endswith('.csv'):
                     return jsonify({'success': False, 'error': 'Only CSV files are allowed'})
                 
+                # Check file size (additional check beyond Flask config)
+                file.seek(0, os.SEEK_END)
+                file_size = file.tell()
+                file.seek(0)  # Reset file pointer
+                
+                if file_size > 16 * 1024 * 1024:  # 16MB
+                    return jsonify({'success': False, 'error': 'File too large. Maximum size is 16MB.'})
+                
                 # Read file content as string
-                file_content = file.read().decode('utf-8')
+                try:
+                    file_content = file.read().decode('utf-8')
+                except UnicodeDecodeError:
+                    # Try with different encodings
+                    file.seek(0)
+                    try:
+                        file_content = file.read().decode('latin1')
+                    except:
+                        return jsonify({'success': False, 'error': 'File encoding error. Please ensure your CSV is properly encoded.'})
                 
                 # Get or create session ID
                 if 'session_id' not in session:
@@ -212,17 +243,28 @@ class VoiceCSVWebApp:
                 session_id = session['session_id']
                 
                 # Create analyzer and load data
-                analyzer = self.get_or_create_analyzer(session_id, file_content)
-                if not analyzer:
-                    return jsonify({'success': False, 'error': 'Failed to load CSV file'})
+                analyzer = CSVAnalyzer(self.api_key)
+                if not analyzer.load_data_from_content(file_content):
+                    return jsonify({'success': False, 'error': 'Failed to parse CSV file. Please check the file format.'})
                 
-                # Store CSV content in session for persistence
+                if not analyzer.create_agent():
+                    return jsonify({'success': False, 'error': 'Failed to create analysis agent'})
+                
+                # Store analyzer in memory
+                self.analyzers[session_id] = analyzer
+                
+                # Store only serializable data in session
                 session['csv_loaded'] = True
                 session['csv_content'] = file_content
                 session['filename'] = secure_filename(file.filename)
+                session.permanent = True  # Make session persistent
                 
-                # Get basic info about the dataset
-                info = analyzer.df_info
+                # Get basic info about the dataset (ensure it's JSON serializable)
+                info = {
+                    'rows': analyzer.df_info['rows'],
+                    'columns': analyzer.df_info['columns'],
+                    'column_names': analyzer.df_info['column_names']
+                }
                 
                 return jsonify({
                     'success': True, 
@@ -232,7 +274,7 @@ class VoiceCSVWebApp:
                 
             except Exception as e:
                 logger.error(f"Error uploading CSV: {e}")
-                return jsonify({'success': False, 'error': str(e)})
+                return jsonify({'success': False, 'error': f'Upload error: {str(e)}'})
 
         @self.app.route('/voice_query', methods=['POST'])
         def voice_query():
@@ -945,7 +987,6 @@ app = assistant.app  # expose Flask app for Gunicorn
 
 if __name__ == "__main__":
     assistant.run()
-
 
 
 
@@ -1803,6 +1844,7 @@ if __name__ == "__main__":
 
 # if __name__ == "__main__":
 #     assistant.run()
+
 
 
 
